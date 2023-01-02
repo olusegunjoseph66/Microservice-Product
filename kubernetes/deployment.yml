@@ -1,0 +1,21 @@
+apiVersion : apps/v1
+kind: Deployment
+metadata:
+  name: productmicroservice
+  labels:
+    app: productmicroservice
+spec:
+  replicas: #replicaNo#
+  selector:
+    matchLabels:
+      app: productmicroservice
+  template:
+    metadata:
+      labels:
+        app: productmicroservice
+    spec:
+      containers:
+        - name: productmicroservice
+          image: dangotedmsimages.azurecr.io/productmicroservice
+          ports:
+            - containerPort: 80

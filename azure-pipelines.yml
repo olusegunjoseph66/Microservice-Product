@@ -1,0 +1,274 @@
+trigger:
+- main
+
+resources:
+- repo: self
+
+variables:
+  tag: '$(Build.BuildId)'
+  imageRepo: 'productmicroservice'
+  registry: 'DR DMS SC UP'
+  azureSubscription: 'DMS ARM SC NRG'
+  kubernetesServiceConnection: 'DMS K8S SC'
+  k8sNamespace: 'default'
+  dev-url: https://dms-product-ms.azurewebsites.net
+  staging-url: 10.224.0.28
+
+stages:
+- stage: Build
+  jobs:
+  - job: Build
+    pool:
+      vmImage: 'windows-latest'
+
+    variables:
+      solution: '**/*.sln'
+      buildPlatform: 'Any CPU'
+      buildConfiguration: 'Release'
+
+    steps:
+    - task: NuGetToolInstaller@1
+      displayName: Install NuGetTool
+
+    - task: NuGetCommand@2
+      displayName: Restore solution
+      inputs:
+        restoreSolution: '$(solution)'
+
+    # - task: SonarCloudPrepare@1
+    #   displayName: Prepare Code Analysis Configuration
+    #   inputs:
+    #     SonarCloud: 'sonarcloud'
+    #     organization: 'bolajiwahab23'
+    #     scannerMode: 'MSBuild'
+    #     projectKey: 'bolajiwahab23_BamBam'
+    #     projectName: 'BamBam'
+
+    - task: VSBuild@1
+      displayName: Build APP
+      inputs:
+        solution: '$(solution)'
+        msbuildArgs: '/p:DeployOnBuild=true /p:WebPublishMethod=Package /p:PackageAsSingleFile=true /p:SkipInvalidConfigurations=true /p:PackageLocation="$(build.artifactStagingDirectory)"'
+        platform: '$(buildPlatform)'
+        configuration: '$(buildConfiguration)'
+
+    - task: VSTest@2
+      displayName: Run Unit tests
+      inputs:
+        platform: '$(buildPlatform)'
+        configuration: '$(buildConfiguration)'
+        testSelector: 'testAssemblies'
+        # TODO: The developer needs to provide test files
+        testAssemblyVer2: |
+          **\*test*.dll
+          !**\*TestAdapter.dll
+          !**\obj\**
+        searchFolder: '$(System.DefaultWorkingDirectory)'
+        runInParallel: true
+        runOnlyImpactedTests: false
+        codeCoverageEnabled: true
+        testRunTitle: 'Run unit tests'
+
+    # - task: BuildQualityChecks@8
+    #   displayName: Check build warnings
+    #   inputs:
+    #     checkWarnings: true
+    #     warningFailOption: 'fixed'
+    #     warningThreshold: '96'
+    #     showStatistics: true
+        # checkCoverage: true
+        # coverageFailOption: 'fixed'
+        # coverageType: 'blocks'
+        # treat0of0as100: true
+        # coverageThreshold: '60'
+    # - task: SonarCloudAnalyze@1
+    #   displayName: Run code analysis
+
+    # - task: SonarCloudPublish@1
+    #   displayName: Publish code analysis
+    #   inputs:
+    #     pollingTimeoutSec: '300'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish APP
+      # Publish APP when on main
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: Images
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: Build
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: CmdLine@2
+      displayName: Prepare image for scan
+      inputs:
+        script: 'docker build -t $(imageRepo):$(tag) -f $(Build.SourcesDirectory)/Dockerfile .'
+
+    - task: CmdLine@2
+      displayName: Scan image for vulnerabilities
+      inputs:
+        script: |
+          # docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          # -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --cache-dir .trivycache/ \
+          # image --exit-code 1 --severity MEDIUM,HIGH --ignore-unfixed $(imageRepo):$(tag)
+          # the exit-code needs to be updated to fix vulnerabilities
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+          -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy --cache-dir .trivycache/ \
+          image --exit-code 0 --severity MEDIUM,HIGH,CRITICAL --ignore-unfixed $(imageRepo):$(tag)
+
+    - task: Docker@2
+      displayName: Build docker image for acr
+      # only build and push images to acr when on main
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        containerRegistry: $(registry)
+        repository: $(imageRepo)
+        command: 'build'
+        Dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        tags: |
+          $(tag)
+
+    - task: Docker@2
+      displayName: Push built docker image to acr
+      # only push image when on main
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        containerRegistry: $(registry)
+        repository: $(imageRepo)
+        command: 'Push'
+        tags: |
+          $(tag)
+
+    - task: PublishPipelineArtifact@1
+      displayName: Publish kubernettes manifests
+      condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/s/kubernetes'
+        artifact: 'manifests'
+        publishLocation: 'pipeline'
+
+- stage: Deploy
+  # only deploy when on main
+  dependsOn: Images
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Development
+    environment: Development
+    displayName: Development
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@0
+            displayName: Download build artifact
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: 'drop'
+              itemPattern:
+              downloadPath: '$(System.ArtifactsDirectory)'
+              cleanDestinationFolder: true
+
+          - task: AzureRmWebAppDeployment@4
+            displayName: Deploy to development
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: $(azureSubscription)
+              ResourceGroupName: 'development'
+              appType: 'webApp'
+              WebAppName: 'dms-product-ms'
+              packageForLinux: '$(System.ArtifactsDirectory)/drop/*.zip'
+
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: 'curl -sSf $(dev-url) > /dev/null'
+              failOnStderr: true
+  # move this step to just before production deployment when production is ready
+  - job: Validation
+    dependsOn: Development
+    pool: 'server'
+    steps:
+    - task: ManualValidation@0
+      timeoutInMinutes: 1440 # task times out in 1 day
+      inputs:
+        # list of users to notify
+        notifyUsers: |
+          bolaji.wahab@verraki.com
+          bolaji.wahab@dangote.com
+        onTimeout: 'reject'
+        instructions: 'Please validate the deployment to development environment and resume'
+
+  - deployment: Staging
+    dependsOn: Validation
+    condition: succeeded()
+    displayName: Staging
+    environment: 'Staging'
+    pool: 'aks-deployment-jumpbox'
+    workspace:
+      clean: all
+    variables:
+      acrsecret: k8sacrauth
+      acrurl: 'dangotedmsimages.azurecr.io'
+      replicaNo: 1
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadPipelineArtifact@2
+            displayName: Download pipeline artifact
+            inputs:
+              buildType: 'current'
+              artifactName: 'manifests'
+              targetPath: '$(Pipeline.Workspace)/manifests'
+
+          - task: KubernetesManifest@0
+            displayName: Create secret
+            inputs:
+              action: 'createSecret'
+              kubernetesServiceConnection: $(kubernetesServiceConnection)
+              namespace: $(k8sNamespace)
+              secretType: 'dockerRegistry'
+              secretName: '$(acrsecret)'
+              dockerRegistryEndpoint: '$(registry)'
+
+          # - task: replacetokens@3
+          #   displayName: Replace Tokens
+          #   inputs:
+          #     rootDirectory: '$(Pipeline.Workspace)/manifests/'
+          #     targetFiles: 'deployment.yml'
+          #     encoding: 'auto'
+          #     writeBOM: true
+          #     actionOnMissing: 'warn'
+          #     keepToken: false
+          #     tokenPrefix: '#'
+          #     tokenSuffix: '#'
+          #     useLegacyPattern: false
+          #     enableTransforms: false
+          #     enableTelemetry: true
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to staging
+            inputs:
+              action: 'deploy'
+              kubernetesServiceConnection: $(kubernetesServiceConnection)
+              namespace: $(k8sNamespace)
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              containers: '$(acrurl)/$(imageRepo):$(tag)'
+              imagePullSecrets: '$(acrsecret)'
+          - task: CmdLine@2
+            displayName: Confirm site is up
+            inputs:
+              script: 'curl -sSf $(staging-url) > /dev/null'
+              failOnStderr: true

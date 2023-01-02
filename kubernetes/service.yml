@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+    name: productmicroservice
+    annotations:
+      service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+    type: LoadBalancer
+    loadBalancerIP: 10.224.0.28
+    ports:
+      - port: 80
+    selector:
+        app: productmicroservice
